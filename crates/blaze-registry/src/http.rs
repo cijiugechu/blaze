@@ -237,6 +237,8 @@ enum ProxyClient<B> {
 /// An HTTP(S) client over hyper 1 and rustls that honors proxy environment variables
 /// (`CARGO_HTTP_PROXY`, `HTTPS_PROXY`/`https_proxy`, `HTTP_PROXY`/`http_proxy`,
 /// `ALL_PROXY`/`all_proxy`, `NO_PROXY`/`no_proxy`).
+/// Cargo's override wins; otherwise lowercase names take precedence. Unlike curl,
+/// uppercase `HTTP_PROXY` is also accepted outside CGI (`REQUEST_METHOD` absent).
 pub struct HttpClient<B> {
     inner: Arc<ClientInner<B>>,
 }
@@ -384,12 +386,12 @@ fn with_default_port(uri: Uri, default_port: u16) -> anyhow::Result<Uri> {
         return Ok(uri);
     }
     let host = uri.host().context("URI has no host")?;
-    let mut parts = uri.into_parts();
     let authority = if host.starts_with('[') || !host.contains(':') {
         format!("{host}:{default_port}")
     } else {
         format!("[{host}]:{default_port}")
     };
+    let mut parts = uri.into_parts();
     parts.authority = Some(authority.parse()?);
     if parts.path_and_query.is_none() {
         parts.path_and_query = Some(hyper::http::uri::PathAndQuery::from_static("/"));
@@ -404,7 +406,7 @@ fn validate_proxy_var(name: &str, val: &str) -> anyhow::Result<()> {
     let probe = Uri::from_static("https://example.com");
     let Some(intercept) = Matcher::builder().all(val).build().intercept(&probe) else {
         bail!(
-            "{name}={val:?} is not a supported proxy address \
+            "{name} is not a supported proxy address \
              (expected http://, https://, socks5://, socks5h://, socks4:// or socks4a://)"
         );
     };
@@ -420,24 +422,33 @@ fn validate_proxy_var(name: &str, val: &str) -> anyhow::Result<()> {
 }
 
 fn matcher_from_env() -> anyhow::Result<Matcher> {
-    if std::env::var_os("REQUEST_METHOD").is_some() {
-        return Ok(Matcher::builder().build());
-    }
+    matcher_from_env_with(|name| std::env::var_os(name))
+}
+
+// Inject reads so tests do not mutate the process environment while other clients use it.
+fn matcher_from_env_with(
+    get: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> anyhow::Result<Matcher> {
     let first = |names: &[&'static str]| -> Option<(&'static str, String)> {
         names.iter().find_map(|&name| {
-            let val = std::env::var(name).ok()?;
+            let val = get(name)?.into_string().ok()?;
             let trimmed = val.trim();
             (!trimmed.is_empty()).then(|| (name, trimmed.to_owned()))
         })
     };
-    let no = first(&["NO_PROXY", "no_proxy"]).map(|(_, v)| v).unwrap_or_default();
+    let no = first(&["no_proxy", "NO_PROXY"]).map(|(_, v)| v).unwrap_or_default();
     if let Some((name, cargo)) = first(&["CARGO_HTTP_PROXY"]) {
         validate_proxy_var(name, &cargo)?;
         return Ok(Matcher::builder().all(cargo).no(no).build());
     }
-    let all = first(&["ALL_PROXY", "all_proxy"]);
-    let http = first(&["HTTP_PROXY", "http_proxy"]);
-    let https = first(&["HTTPS_PROXY", "https_proxy"]);
+    let all = first(&["all_proxy", "ALL_PROXY"]);
+    // CGI maps the incoming Proxy header to HTTP_PROXY; it is not trusted config.
+    let http = if get("REQUEST_METHOD").is_some() {
+        first(&["http_proxy"])
+    } else {
+        first(&["http_proxy", "HTTP_PROXY"])
+    };
+    let https = first(&["https_proxy", "HTTPS_PROXY"]);
     if let Some((name, val)) = &http {
         validate_proxy_var(name, val)?;
     }
@@ -675,6 +686,110 @@ mod tests {
         );
         let ipv6: Uri = "socks5://[::1]/".parse().unwrap();
         assert_eq!(with_default_port(ipv6, 1080).unwrap().to_string(), "socks5://[::1]:1080/");
+    }
+
+    #[test]
+    fn proxy_errors_do_not_disclose_credentials() {
+        for value in [
+            "ftp://private-user:private-password@proxy.example",
+            "http://private-user:private-password@proxy.example:bad port",
+            "socks4://private-user:private-password@proxy.example",
+            "socks4a://private-user:private-password@proxy.example",
+        ] {
+            let error = validate_proxy_var("HTTPS_PROXY", value).unwrap_err();
+            let message = format!("{error:#}");
+            assert!(message.contains("HTTPS_PROXY"));
+            assert!(!message.contains("private-user"));
+            assert!(!message.contains("private-password"));
+        }
+    }
+
+    fn proxy_env(vars: &[(&str, &str)]) -> anyhow::Result<Matcher> {
+        matcher_from_env_with(|name| {
+            vars.iter().find(|(key, _)| *key == name).map(|(_, value)| (*value).into())
+        })
+    }
+
+    #[test]
+    fn lowercase_proxy_settings_win() {
+        for (lower, upper, scheme) in [
+            ("http_proxy", "HTTP_PROXY", "http"),
+            ("https_proxy", "HTTPS_PROXY", "https"),
+            ("all_proxy", "ALL_PROXY", "http"),
+            ("all_proxy", "ALL_PROXY", "https"),
+        ] {
+            let matcher = proxy_env(&[
+                (lower, "http://preferred.example:8080"),
+                (upper, "ftp://invalid.example"),
+            ])
+            .unwrap();
+            let uri: Uri = format!("{scheme}://origin.example").parse().unwrap();
+            assert_eq!(matcher.intercept(&uri).unwrap().uri().host(), Some("preferred.example"));
+        }
+        let matcher = proxy_env(&[
+            ("all_proxy", "http://proxy.example"),
+            ("no_proxy", "lower.example"),
+            ("NO_PROXY", "upper.example"),
+        ])
+        .unwrap();
+        assert!(matcher.intercept(&Uri::from_static("https://lower.example")).is_none());
+        assert!(matcher.intercept(&Uri::from_static("https://upper.example")).is_some());
+    }
+
+    #[test]
+    fn cgi_keeps_trusted_proxy_settings() {
+        for (name, scheme) in [
+            ("CARGO_HTTP_PROXY", "http"),
+            ("CARGO_HTTP_PROXY", "https"),
+            ("http_proxy", "http"),
+            ("HTTPS_PROXY", "https"),
+            ("https_proxy", "https"),
+            ("ALL_PROXY", "http"),
+            ("ALL_PROXY", "https"),
+            ("all_proxy", "http"),
+            ("all_proxy", "https"),
+        ] {
+            let matcher = proxy_env(&[
+                ("REQUEST_METHOD", "GET"),
+                ("HTTP_PROXY", "ftp://untrusted.example"),
+                (name, "http://trusted.example:8080"),
+            ])
+            .unwrap();
+            let uri: Uri = format!("{scheme}://origin.example").parse().unwrap();
+            assert_eq!(matcher.intercept(&uri).unwrap().uri().host(), Some("trusted.example"));
+        }
+        let matcher =
+            proxy_env(&[("REQUEST_METHOD", ""), ("HTTP_PROXY", "http://untrusted.example")])
+                .unwrap();
+        assert!(matcher.intercept(&Uri::from_static("http://origin.example")).is_none());
+        assert!(
+            proxy_env(&[("REQUEST_METHOD", "GET"), ("HTTPS_PROXY", "ftp://invalid.example")])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn cargo_proxy_override_and_no_proxy_work_in_cgi() {
+        let matcher = proxy_env(&[
+            ("REQUEST_METHOD", "GET"),
+            ("CARGO_HTTP_PROXY", "http://cargo.example:8080"),
+            ("http_proxy", "ftp://invalid.example"),
+            ("https_proxy", "ftp://invalid.example"),
+            ("all_proxy", "ftp://invalid.example"),
+            ("no_proxy", "direct.example"),
+        ])
+        .unwrap();
+        for scheme in ["http", "https"] {
+            let uri: Uri = format!("{scheme}://origin.example").parse().unwrap();
+            assert_eq!(matcher.intercept(&uri).unwrap().uri().host(), Some("cargo.example"));
+            let direct: Uri = format!("{scheme}://direct.example").parse().unwrap();
+            assert!(matcher.intercept(&direct).is_none());
+        }
+        let matcher = proxy_env(&[("HTTP_PROXY", "http://uppercase.example")]).unwrap();
+        assert_eq!(
+            matcher.intercept(&Uri::from_static("http://origin.example")).unwrap().uri().host(),
+            Some("uppercase.example")
+        );
     }
 
     #[test]
