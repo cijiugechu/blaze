@@ -11,16 +11,25 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use anyhow::Context;
+use anyhow::{Context, bail};
 use http_body_util::{BodyExt, Full};
 use hyper::{
-    Method, Request, StatusCode,
-    body::{Bytes, Incoming},
+    Method, Request, StatusCode, Uri,
+    body::{Body, Bytes, Incoming},
     header,
 };
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::{
-    client::legacy::{Client, connect::HttpConnector},
+    client::{
+        legacy::{
+            Client,
+            connect::{
+                HttpConnector,
+                proxy::{SocksV4, SocksV5, Tunnel},
+            },
+        },
+        proxy::matcher::{Intercept, Matcher},
+    },
     rt::TokioExecutor,
 };
 
@@ -214,6 +223,240 @@ impl fmt::Display for Transport {
 
 impl std::error::Error for Transport {}
 
+type DirectClient<B> = Client<HttpsConnector<HttpConnector>, B>;
+type TunnelClient<B> = Client<HttpsConnector<Tunnel<HttpsConnector<HttpConnector>>>, B>;
+type SocksV5Client<B> = Client<HttpsConnector<SocksV5<HttpConnector>>, B>;
+type SocksV4Client<B> = Client<HttpsConnector<SocksV4<HttpConnector>>, B>;
+
+enum ProxyClient<B> {
+    Tunnel(TunnelClient<B>),
+    SocksV5(SocksV5Client<B>),
+    SocksV4(SocksV4Client<B>),
+}
+
+/// An HTTP(S) client over hyper 1 and rustls that honors proxy environment variables
+/// (`CARGO_HTTP_PROXY`, `HTTPS_PROXY`/`https_proxy`, `HTTP_PROXY`/`http_proxy`,
+/// `ALL_PROXY`/`all_proxy`, `NO_PROXY`/`no_proxy`).
+pub struct HttpClient<B> {
+    inner: Arc<ClientInner<B>>,
+}
+
+struct ClientInner<B> {
+    direct: DirectClient<B>,
+    connect_timeout: Option<Duration>,
+    matcher: Matcher,
+    http_proxy: OnceLock<ProxyClient<B>>,
+    https_proxy: OnceLock<ProxyClient<B>>,
+}
+
+impl<B> Clone for HttpClient<B> {
+    fn clone(&self) -> Self {
+        HttpClient { inner: Arc::clone(&self.inner) }
+    }
+}
+
+impl<B> HttpClient<B>
+where
+    B: Body + Send + Unpin + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    pub fn new(connect_timeout: Option<Duration>) -> anyhow::Result<HttpClient<B>> {
+        HttpClient::with_matcher(connect_timeout, matcher_from_env()?)
+    }
+
+    pub fn with_matcher(
+        connect_timeout: Option<Duration>,
+        matcher: Matcher,
+    ) -> anyhow::Result<HttpClient<B>> {
+        let direct = Client::builder(TokioExecutor::new()).build(https_connector(connect_timeout)?);
+        Ok(HttpClient {
+            inner: Arc::new(ClientInner {
+                direct,
+                connect_timeout,
+                matcher,
+                http_proxy: OnceLock::new(),
+                https_proxy: OnceLock::new(),
+            }),
+        })
+    }
+
+    pub async fn request(&self, mut req: Request<B>) -> anyhow::Result<hyper::Response<Incoming>> {
+        let Some(intercept) = self.inner.matcher.intercept(req.uri()) else {
+            return Ok(self.inner.direct.request(req).await?);
+        };
+        let is_https = req.uri().scheme_str() == Some("https");
+        if req.uri().scheme_str() == Some("http") && req.uri().port().is_none() {
+            *req.uri_mut() = with_default_port(req.uri().clone(), 80)?;
+        }
+        let slot = if is_https { &self.inner.https_proxy } else { &self.inner.http_proxy };
+        let proxy = match slot.get() {
+            Some(proxy) => proxy,
+            None => {
+                let built = ProxyClient::new(&intercept, self.inner.connect_timeout)?;
+                let _ = slot.set(built);
+                slot.get().expect("proxy client just initialized")
+            }
+        };
+        proxy.request(req).await
+    }
+}
+
+impl<B> ProxyClient<B>
+where
+    B: Body + Send + Unpin + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    fn new(intercept: &Intercept, connect_timeout: Option<Duration>) -> anyhow::Result<Self> {
+        let scheme = intercept.uri().scheme_str().unwrap_or("http");
+        let roots = HttpsConnectorBuilder::new()
+            .with_native_roots()
+            .context("the machine's certificates cannot be read")?
+            .https_or_http()
+            .enable_http1();
+        match scheme {
+            "http" | "https" => {
+                let mut tunnel =
+                    Tunnel::new(intercept.uri().clone(), https_connector(connect_timeout)?);
+                if let Some(auth) = intercept.basic_auth() {
+                    tunnel = tunnel.with_auth(auth.clone());
+                }
+                let connector = roots.wrap_connector(tunnel);
+                Ok(ProxyClient::Tunnel(Client::builder(TokioExecutor::new()).build(connector)))
+            }
+            "socks5" | "socks5h" => {
+                let proxy_uri = with_default_port(intercept.uri().clone(), 1080)?;
+                let mut socks = SocksV5::new(proxy_uri, http_connector(connect_timeout))
+                    .local_dns(scheme == "socks5");
+                if let Some((user, pass)) = intercept.raw_auth() {
+                    socks = socks.with_auth(user.to_owned(), pass.to_owned());
+                }
+                let connector = roots.wrap_connector(socks);
+                Ok(ProxyClient::SocksV5(Client::builder(TokioExecutor::new()).build(connector)))
+            }
+            "socks4" | "socks4a" => {
+                if intercept.raw_auth().is_some() {
+                    bail!(
+                        "socks4 proxy `{}` does not support username/password authentication; \
+                         use socks5:// instead",
+                        intercept.uri()
+                    );
+                }
+                let proxy_uri = with_default_port(intercept.uri().clone(), 1080)?;
+                let socks = SocksV4::new(proxy_uri, http_connector(connect_timeout))
+                    .local_dns(scheme == "socks4");
+                let connector = roots.wrap_connector(socks);
+                Ok(ProxyClient::SocksV4(Client::builder(TokioExecutor::new()).build(connector)))
+            }
+            other => bail!("unsupported proxy scheme `{other}` in `{}`", intercept.uri()),
+        }
+    }
+
+    async fn request(&self, req: Request<B>) -> anyhow::Result<hyper::Response<Incoming>> {
+        let response = match self {
+            ProxyClient::Tunnel(client) => client.request(req).await?,
+            ProxyClient::SocksV5(client) => client.request(req).await?,
+            ProxyClient::SocksV4(client) => client.request(req).await?,
+        };
+        Ok(response)
+    }
+}
+
+fn http_connector(connect_timeout: Option<Duration>) -> HttpConnector {
+    let mut http = HttpConnector::new();
+    http.enforce_http(false);
+    http.set_connect_timeout(connect_timeout);
+    http
+}
+
+fn https_connector(
+    connect_timeout: Option<Duration>,
+) -> anyhow::Result<HttpsConnector<HttpConnector>> {
+    let roots = HttpsConnectorBuilder::new()
+        .with_native_roots()
+        .context("the machine's certificates cannot be read")?;
+    Ok(roots.https_or_http().enable_http1().wrap_connector(http_connector(connect_timeout)))
+}
+
+fn with_default_port(uri: Uri, default_port: u16) -> anyhow::Result<Uri> {
+    if uri.port().is_some() {
+        return Ok(uri);
+    }
+    let host = uri.host().context("URI has no host")?;
+    let mut parts = uri.into_parts();
+    let authority = if host.starts_with('[') || !host.contains(':') {
+        format!("{host}:{default_port}")
+    } else {
+        format!("[{host}]:{default_port}")
+    };
+    parts.authority = Some(authority.parse()?);
+    if parts.path_and_query.is_none() {
+        parts.path_and_query = Some(hyper::http::uri::PathAndQuery::from_static("/"));
+    }
+    Ok(Uri::from_parts(parts)?)
+}
+
+fn validate_proxy_var(name: &str, val: &str) -> anyhow::Result<()> {
+    if val.is_empty() {
+        return Ok(());
+    }
+    let probe = Uri::from_static("https://example.com");
+    let Some(intercept) = Matcher::builder().all(val).build().intercept(&probe) else {
+        bail!(
+            "{name}={val:?} is not a supported proxy address \
+             (expected http://, https://, socks5://, socks5h://, socks4:// or socks4a://)"
+        );
+    };
+    if matches!(intercept.uri().scheme_str(), Some("socks4" | "socks4a"))
+        && intercept.raw_auth().is_some()
+    {
+        bail!(
+            "{name}: socks4 proxy does not support username/password authentication; \
+             use socks5:// instead"
+        );
+    }
+    Ok(())
+}
+
+fn matcher_from_env() -> anyhow::Result<Matcher> {
+    if std::env::var_os("REQUEST_METHOD").is_some() {
+        return Ok(Matcher::builder().build());
+    }
+    let first = |names: &[&'static str]| -> Option<(&'static str, String)> {
+        names.iter().find_map(|&name| {
+            let val = std::env::var(name).ok()?;
+            let trimmed = val.trim();
+            (!trimmed.is_empty()).then(|| (name, trimmed.to_owned()))
+        })
+    };
+    let no = first(&["NO_PROXY", "no_proxy"]).map(|(_, v)| v).unwrap_or_default();
+    if let Some((name, cargo)) = first(&["CARGO_HTTP_PROXY"]) {
+        validate_proxy_var(name, &cargo)?;
+        return Ok(Matcher::builder().all(cargo).no(no).build());
+    }
+    let all = first(&["ALL_PROXY", "all_proxy"]);
+    let http = first(&["HTTP_PROXY", "http_proxy"]);
+    let https = first(&["HTTPS_PROXY", "https_proxy"]);
+    if let Some((name, val)) = &http {
+        validate_proxy_var(name, val)?;
+    }
+    if let Some((name, val)) = &https {
+        validate_proxy_var(name, val)?;
+    }
+    if (http.is_none() || https.is_none())
+        && let Some((name, val)) = &all
+    {
+        validate_proxy_var(name, val)?;
+    }
+    Ok(Matcher::builder()
+        .all(all.map(|(_, v)| v).unwrap_or_default())
+        .http(http.map(|(_, v)| v).unwrap_or_default())
+        .https(https.map(|(_, v)| v).unwrap_or_default())
+        .no(no)
+        .build())
+}
+
 /// How many redirects one request follows.
 const REDIRECTS: usize = 10;
 /// How many requests [`HyperHttp::get_async`] has in flight at once, each on a connection of
@@ -231,7 +474,7 @@ pub struct HyperHttp {
 /// What one request needs, cheap to clone into a task of the runtime.
 #[derive(Clone)]
 struct Requests {
-    client: Client<HttpsConnector<HttpConnector>, Full<Bytes>>,
+    client: HttpClient<Full<Bytes>>,
     user_agent: Arc<str>,
     /// How long a connection or a transfer may go without a byte, cargo's `http.timeout`.
     timeout: Duration,
@@ -244,11 +487,7 @@ impl HyperHttp {
             .thread_name("blaze-registry http")
             .enable_all()
             .build()?;
-        let roots = HttpsConnectorBuilder::new()
-            .with_native_roots()
-            .context("the machine's certificates cannot be read")?;
-        let connector = roots.https_or_http().enable_http1().build();
-        let client = Client::builder(TokioExecutor::new()).build(connector);
+        let client = HttpClient::new(None)?;
         // No version: this crate is under every build of blaze, and the release blaze is is told
         // only to the engine (its build.rs), so that a release changes no crate below it.
         let user_agent = "blaze (https://github.com/indexable-inc/blaze)".into();
@@ -420,5 +659,32 @@ mod tests {
         };
         assert_eq!(retry_after(&answer(429, "2")), Some(2000));
         assert_eq!(retry_after(&answer(500, "2")), None);
+    }
+
+    #[test]
+    fn adds_default_ports_to_uris() {
+        let http: Uri = "http://example.com/a/b?c=1".parse().unwrap();
+        assert_eq!(
+            with_default_port(http, 80).unwrap().to_string(),
+            "http://example.com:80/a/b?c=1"
+        );
+        let explicit: Uri = "http://example.com:8080/a".parse().unwrap();
+        assert_eq!(
+            with_default_port(explicit, 80).unwrap().to_string(),
+            "http://example.com:8080/a"
+        );
+        let ipv6: Uri = "socks5://[::1]/".parse().unwrap();
+        assert_eq!(with_default_port(ipv6, 1080).unwrap().to_string(), "socks5://[::1]:1080/");
+    }
+
+    #[test]
+    fn validates_proxy_addresses() {
+        assert!(validate_proxy_var("HTTPS_PROXY", "http://127.0.0.1:7890").is_ok());
+        assert!(validate_proxy_var("HTTPS_PROXY", "127.0.0.1:7890").is_ok());
+        assert!(validate_proxy_var("ALL_PROXY", "socks5h://user:pass@127.0.0.1:1080").is_ok());
+        assert!(validate_proxy_var("ALL_PROXY", "socks4a://127.0.0.1:1080").is_ok());
+        assert!(validate_proxy_var("ALL_PROXY", "socks4://user:pass@127.0.0.1:1080").is_err());
+        assert!(validate_proxy_var("HTTPS_PROXY", "ftp://127.0.0.1:21").is_err());
+        assert!(validate_proxy_var("HTTPS_PROXY", "://not-a-uri").is_err());
     }
 }
