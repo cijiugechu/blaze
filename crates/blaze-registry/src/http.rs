@@ -237,7 +237,8 @@ enum ProxyClient<B> {
 /// An HTTP(S) client over hyper 1 and rustls that honors proxy environment variables
 /// (`CARGO_HTTP_PROXY`, `HTTPS_PROXY`/`https_proxy`, `HTTP_PROXY`/`http_proxy`,
 /// `ALL_PROXY`/`all_proxy`, `NO_PROXY`/`no_proxy`).
-/// Cargo's override wins; otherwise lowercase names take precedence. Unlike curl,
+/// Cargo's override wins (an empty value disables proxies); otherwise lowercase names
+/// take precedence. In Windows CGI, neither HTTP proxy alias is trusted. Unlike curl,
 /// uppercase `HTTP_PROXY` is also accepted outside CGI (`REQUEST_METHOD` absent).
 pub struct HttpClient<B> {
     inner: Arc<ClientInner<B>>,
@@ -422,12 +423,13 @@ fn validate_proxy_var(name: &str, val: &str) -> anyhow::Result<()> {
 }
 
 fn matcher_from_env() -> anyhow::Result<Matcher> {
-    matcher_from_env_with(|name| std::env::var_os(name))
+    matcher_from_env_with(|name| std::env::var_os(name), cfg!(windows))
 }
 
 // Inject reads so tests do not mutate the process environment while other clients use it.
 fn matcher_from_env_with(
     get: impl Fn(&str) -> Option<std::ffi::OsString>,
+    case_insensitive_names: bool,
 ) -> anyhow::Result<Matcher> {
     let first = |names: &[&'static str]| -> Option<(&'static str, String)> {
         names.iter().find_map(|&name| {
@@ -437,14 +439,17 @@ fn matcher_from_env_with(
         })
     };
     let no = first(&["no_proxy", "NO_PROXY"]).map(|(_, v)| v).unwrap_or_default();
-    if let Some((name, cargo)) = first(&["CARGO_HTTP_PROXY"]) {
-        validate_proxy_var(name, &cargo)?;
+    // Presence matters: Cargo's empty override explicitly disables inherited proxies.
+    if let Some(cargo) = get("CARGO_HTTP_PROXY") {
+        let cargo = cargo.to_str().context("CARGO_HTTP_PROXY is not valid Unicode")?.trim();
+        validate_proxy_var("CARGO_HTTP_PROXY", cargo)?;
         return Ok(Matcher::builder().all(cargo).no(no).build());
     }
     let all = first(&["all_proxy", "ALL_PROXY"]);
     // CGI maps the incoming Proxy header to HTTP_PROXY; it is not trusted config.
+    // Windows aliases lowercase lookups to that same untrusted variable.
     let http = if get("REQUEST_METHOD").is_some() {
-        first(&["http_proxy"])
+        if case_insensitive_names { None } else { first(&["http_proxy"]) }
     } else {
         first(&["http_proxy", "HTTP_PROXY"])
     };
@@ -705,9 +710,80 @@ mod tests {
     }
 
     fn proxy_env(vars: &[(&str, &str)]) -> anyhow::Result<Matcher> {
-        matcher_from_env_with(|name| {
-            vars.iter().find(|(key, _)| *key == name).map(|(_, value)| (*value).into())
-        })
+        proxy_env_for_platform(vars, false)
+    }
+
+    fn proxy_env_for_platform(
+        vars: &[(&str, &str)],
+        case_insensitive_names: bool,
+    ) -> anyhow::Result<Matcher> {
+        matcher_from_env_with(
+            |name| {
+                vars.iter()
+                    .find(|(key, _)| {
+                        if case_insensitive_names {
+                            key.eq_ignore_ascii_case(name)
+                        } else {
+                            *key == name
+                        }
+                    })
+                    .map(|(_, value)| (*value).into())
+            },
+            case_insensitive_names,
+        )
+    }
+
+    #[test]
+    fn empty_cargo_proxy_disables_inherited_proxies() {
+        for case_insensitive_names in [false, true] {
+            for cgi in [false, true] {
+                let mut vars = vec![
+                    ("CARGO_HTTP_PROXY", ""),
+                    ("HTTP_PROXY", "http://inherited.example"),
+                    ("HTTPS_PROXY", "http://inherited.example"),
+                    ("ALL_PROXY", "ftp://invalid.example"),
+                ];
+                if cgi {
+                    vars.push(("REQUEST_METHOD", "GET"));
+                }
+                let matcher = proxy_env_for_platform(&vars, case_insensitive_names).unwrap();
+                for uri in ["http://origin.example", "https://origin.example"] {
+                    assert!(matcher.intercept(&uri.parse().unwrap()).is_none());
+                }
+            }
+            // An absent override still honors inherited proxies.
+            let matcher = proxy_env_for_platform(
+                &[("HTTPS_PROXY", "http://inherited.example")],
+                case_insensitive_names,
+            )
+            .unwrap();
+            assert!(matcher.intercept(&Uri::from_static("https://origin.example")).is_some());
+        }
+    }
+
+    #[test]
+    fn windows_cgi_ignores_http_proxy_aliases() {
+        for alias in ["HTTP_PROXY", "http_proxy", "Http_Proxy"] {
+            let mut vars = vec![("REQUEST_METHOD", "GET"), (alias, "http://untrusted.example")];
+            let matcher = proxy_env_for_platform(&vars, true).unwrap();
+            assert!(matcher.intercept(&Uri::from_static("http://origin.example")).is_none());
+            // Trusted settings remain usable even with the untrusted HTTP alias present.
+            for (name, uri) in [
+                ("CARGO_HTTP_PROXY", "http://origin.example"),
+                ("CARGO_HTTP_PROXY", "https://origin.example"),
+                ("HTTPS_PROXY", "https://origin.example"),
+                ("ALL_PROXY", "http://origin.example"),
+                ("ALL_PROXY", "https://origin.example"),
+            ] {
+                vars.push((name, "http://trusted.example"));
+                let matcher = proxy_env_for_platform(&vars, true).unwrap();
+                assert_eq!(
+                    matcher.intercept(&uri.parse().unwrap()).unwrap().uri().host(),
+                    Some("trusted.example")
+                );
+                vars.pop();
+            }
+        }
     }
 
     #[test]
